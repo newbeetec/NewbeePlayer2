@@ -15,6 +15,9 @@ class PlaylistManager private constructor(context: Context) {
         private set
 
     enum class PlayMode { ORDER, SINGLE_LOOP, RANDOM }
+    var speakerMode: Boolean
+        get() = prefs.getBoolean("speaker_mode", true)  // 默认扬声器
+        set(value) = prefs.edit().putBoolean("speaker_mode", value).apply()
 
     var playMode: PlayMode
         get() = PlayMode.valueOf(prefs.getString("play_mode", PlayMode.ORDER.name)!!)

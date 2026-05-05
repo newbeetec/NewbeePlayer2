@@ -178,8 +178,15 @@ class MainActivity : AppCompatActivity() {
             ): Boolean {
                 val from = viewHolder.bindingAdapterPosition
                 val to = target.bindingAdapterPosition
-                adapter.moveItem(from, to)
+
+                // 只让 PlaylistManager 执行移动，避免重复修改数据
                 playlistManager.moveSong(from, to)
+                // 通知服务更新内部播放索引
+                musicService?.updateIndexAfterMove(from, to)
+                // 仅刷新界面
+                adapter.notifyItemMoved(from, to)
+                // 刷新高亮
+                adapter.setCurrentPlaying(musicService?.getCurrentIndex() ?: -1)
                 return true
             }
 
@@ -188,8 +195,14 @@ class MainActivity : AppCompatActivity() {
                 direction: Int
             ) {
                 val pos = viewHolder.bindingAdapterPosition
+                // 先更新服务索引（因为需要根据当前状态判断）
+                musicService?.updateIndexAfterRemove(pos)
+                // 再删除数据
                 playlistManager.removeSong(pos)
+                // 通知适配器刷新
                 adapter.notifyItemRemoved(pos)
+                // 刷新高亮
+                adapter.setCurrentPlaying(musicService?.getCurrentIndex() ?: -1)
             }
 
             override fun isLongPressDragEnabled() = false

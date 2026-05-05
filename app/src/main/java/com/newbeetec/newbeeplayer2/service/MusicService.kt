@@ -14,6 +14,8 @@ import android.telephony.TelephonyManager
 import androidx.core.app.NotificationCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.newbeetec.newbeeplayer2.manager.PlaylistManager
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
 
 class MusicService : Service() {
     private val binder = LocalBinder()
@@ -21,8 +23,11 @@ class MusicService : Service() {
     private lateinit var playlistManager: PlaylistManager
     private lateinit var audioManager: AudioManager
     private var currentIndex = -1
-    private var isSpeakerOn = true
+    private var isSpeakerOn = true // 将在 onCreate 中覆盖
     private var playMode: PlaylistManager.PlayMode = PlaylistManager.PlayMode.ORDER
+    private var screenWakeLock: PowerManager.WakeLock? = null
+    private var audioDeviceCallback: AudioDeviceCallback? = null
+    private var isApplyingAudioOutput = false   // 防止循环触发
 
     companion object {
         const val ACTION_PLAYBACK_ERROR = "com.newbeetec.newbeeplayer2.PLAYBACK_ERROR"
@@ -49,6 +54,77 @@ class MusicService : Service() {
         }
     }
 
+    private val deviceCallback = object : AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
+            checkAndForceEarpiece()
+        }
+
+        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
+            checkAndForceEarpiece()
+        }
+    }
+
+    private fun checkAndForceEarpiece() {
+        // 只在听筒模式且未被自身修改时检查
+        if (isSpeakerOn || isApplyingAudioOutput) return
+
+        // 获取当前输出设备
+        val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        var hasSpeaker = false
+        var hasEarpiece = false
+
+        for (device in devices) {
+            when (device.type) {
+                AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> hasSpeaker = true
+                AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> hasEarpiece = true
+            }
+        }
+
+        // 如果激活的设备是扬声器而不是听筒，说明被其他应用切换，强制恢复
+        if (hasSpeaker && !hasEarpiece) {
+            // 先暂时注销回调，防止递归
+            unregisterAudioDeviceCallback()
+            // 重新应用听筒设置
+            applyAudioOutput()
+            // 重新注册回调
+            registerAudioDeviceCallback()
+        }
+    }
+
+    private fun registerAudioDeviceCallback() {
+        if (audioDeviceCallback == null) {
+            audioDeviceCallback = deviceCallback
+            audioManager.registerAudioDeviceCallback(deviceCallback, Handler(Looper.getMainLooper()))
+        }
+    }
+
+    private fun unregisterAudioDeviceCallback() {
+        audioDeviceCallback?.let {
+            audioManager.unregisterAudioDeviceCallback(it)
+            audioDeviceCallback = null
+        }
+    }
+
+    private fun updateScreenWakeLock() {
+        val shouldKeepScreenOn = mediaPlayer?.isPlaying == true
+        if (shouldKeepScreenOn) {
+            if (screenWakeLock == null) {
+                screenWakeLock = powerManager.newWakeLock(
+                    PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                    "NewbeePlayer:screen"
+                )
+            }
+            if (screenWakeLock?.isHeld == false) {
+                screenWakeLock?.acquire(10 * 60 * 1000L) // 最长10分钟
+            }
+        } else {
+            screenWakeLock?.let {
+                if (it.isHeld) it.release()
+            }
+            screenWakeLock = null
+        }
+    }
+
     // 接近传感器与WakeLock（仅听筒模式且播放时激活）
     private lateinit var powerManager: PowerManager
     private var proximityWakeLock: PowerManager.WakeLock? = null
@@ -66,6 +142,9 @@ class MusicService : Service() {
         telephonyManager = getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
         telephonyManager.listen(phoneStateListener, PhoneStateListener.LISTEN_CALL_STATE)
         startForegroundWithInitialNotification()
+        // 恢复上次的输出模式
+        isSpeakerOn = playlistManager.speakerMode
+        applyAudioOutput()        // ★ 关键：立即应用到系统音频
     }
 
     private fun startForegroundWithInitialNotification() {
@@ -132,6 +211,7 @@ class MusicService : Service() {
                 }
                 setOnPreparedListener { mp ->
                     mp.start()
+                    updateScreenWakeLock()
                     sendPlayStateChanged()   // 添加这一行
                     updateNotification()
                     updateProximityWakeLock()
@@ -208,6 +288,7 @@ class MusicService : Service() {
             return
         }
         mediaPlayer?.pause()
+        updateScreenWakeLock()
         sendPlayStateChanged()   // 添加
         updateProximityWakeLock()
     }
@@ -218,6 +299,7 @@ class MusicService : Service() {
             return
         }
         mediaPlayer?.start()
+        updateScreenWakeLock()
         sendPlayStateChanged()   // 添加
         updateProximityWakeLock()
     }
@@ -234,22 +316,46 @@ class MusicService : Service() {
                 pause()                     // ★ 强制暂停
             }
             isSpeakerOn = speaker
+            playlistManager.speakerMode = speaker   // ★ 持久化
             applyAudioOutput()
             updateProximityWakeLock()
             releasePlayer()
         }
     }
 
+    fun updateIndexAfterMove(from: Int, to: Int) {
+        if (currentIndex == from) {
+            currentIndex = to
+        } else if (currentIndex in minOf(from, to)..maxOf(from, to)) {
+            if (from < to) currentIndex-- else currentIndex++
+        }
+    }
+
+    fun updateIndexAfterRemove(position: Int) {
+        when {
+            position < currentIndex -> currentIndex--
+            position == currentIndex -> {
+                releasePlayer()
+                currentIndex = -1
+                updateNotification()
+            }
+        }
+    }
+
     fun getSpeakerMode(): Boolean = isSpeakerOn
 
     private fun applyAudioOutput() {
+        isApplyingAudioOutput = true
         if (isSpeakerOn) {
             audioManager.mode = AudioManager.MODE_NORMAL
             audioManager.isSpeakerphoneOn = true
+            unregisterAudioDeviceCallback()
         } else {
             audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
             audioManager.isSpeakerphoneOn = false
+            registerAudioDeviceCallback()
         }
+        isApplyingAudioOutput = false
     }
 
     // 接近传感器控制屏幕（听筒靠近黑屏）
@@ -328,11 +434,14 @@ class MusicService : Service() {
         mediaPlayer = null
         abandonAudioFocus()
         updateProximityWakeLock()
+        updateScreenWakeLock()
     }
 
     override fun onDestroy() {
         releasePlayer()
         telephonyManager.listen(phoneStateListener, PhoneStateListener.LISTEN_NONE)
+        screenWakeLock?.let { if (it.isHeld) it.release() }
+        unregisterAudioDeviceCallback()
         super.onDestroy()
     }
 }
